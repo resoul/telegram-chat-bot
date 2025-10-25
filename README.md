@@ -14,7 +14,11 @@ git clone https://github.com/resoul/telegram-chat-bot.git
 cd telegram-chat-bot
 go install
 ```
-2. Create a .env file in the project root and add your keys:
+2. Create your environment file:
+```
+cp example.env .env
+```
+3. Then open .env and replace the placeholder values with your own API keys:
 ````
 GEMINI_API_KEY=your_gemini_key
 TELEGRAM_API_TOKEN=your_telegram_token
