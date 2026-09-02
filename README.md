@@ -31,7 +31,7 @@ implementing a client in another language, or auditing the protocol.
 ## Install
 
 ```
-go get gitlab.com/resoul/wireauth
+go get github.com/resoul/wireauth
 ```
 
 Requires Go 1.22+ (uses `crypto/ecdh`, standard library only — no
