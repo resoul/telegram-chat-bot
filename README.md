@@ -16,6 +16,18 @@ The exact wire format (byte layout of every message) is documented in
 [`HANDSHAKE_SPEC.md`](./HANDSHAKE_SPEC.md) — read that if you're
 implementing a client in another language, or auditing the protocol.
 
+> **Security note (protocol v2):** the handshake now signs the full
+> transcript — both nonces *and* both ECDH public keys — closing a gap in
+> the original protocol where the RSA signature covered only the nonces,
+> leaving the ECDH exchange itself unauthenticated against an active
+> network attacker. See the security advisory at the top of
+> `HANDSHAKE_SPEC.md`. **v2 is the default; the old protocol is available
+> only via the explicit `AllowLegacyV1()` option for staged client
+> migrations, and must never run outside TLS.** If every client you talk
+> to already speaks v2, do nothing — `Perform` handles both stages
+> internally. If you have existing v1 clients, see "Migrating from v1"
+> below before upgrading this package.
+
 ## Install
 
 ```
@@ -76,22 +88,21 @@ func main() {
 			return
 		}
 
-		// session.AESKey (32 bytes) and session.ServerNonce (16 bytes) are
-		// now shared between you and the client. Use them to encrypt/decrypt
-		// every subsequent message on this connection:
+			// Session keys are direction-separated. The server decrypts incoming
+			// packets with ClientToServerKey and encrypts replies with ServerToClientKey.
 		for {
 			_, packet, err := conn.ReadMessage()
 			if err != nil {
 				return
 			}
-			plaintext, seq, err := wireauth.DecryptAESGCM(session.AESKey, packet)
+			plaintext, seq, err := wireauth.DecryptAESGCM(session.ClientToServerKey, packet)
 			if err != nil {
 				log.Println("decrypt failed:", err)
 				return
 			}
 			log.Printf("got message #%d: %s", seq, plaintext)
 
-			reply, _ := wireauth.EncryptAESGCM(session.AESKey, []byte("ack"), seq)
+			reply, _ := wireauth.EncryptAESGCM(session.ServerToClientKey, []byte("ack"), seq)
 			conn.WriteMessage(websocket.BinaryMessage, reply)
 		}
 	})
@@ -121,19 +132,45 @@ srv := wireauth.NewServer(privateKey,
 // (ReadMessage() (int, []byte, error) + WriteMessage(int, []byte) error —
 // *websocket.Conn already qualifies).
 session, err := srv.Perform(ctx, conn)
-// session.AESKey      []byte, 32 bytes — use as the AES-256-GCM key
+// session.ClientToServerKey []byte, 32 bytes — decrypt client packets
+// session.ServerToClientKey []byte, 32 bytes — encrypt server packets
 // session.ServerNonce []byte, 16 bytes — needed later for resume proofs
 
 // Encrypt/decrypt messages on the now-secure channel.
 // seq must be unique and monotonically increasing per direction
 // (e.g. a simple counter) — it's used as AEAD associated data.
-packet, err := wireauth.EncryptAESGCM(session.AESKey, plaintext, seq)
-plaintext, seq, err := wireauth.DecryptAESGCM(session.AESKey, packet)
+packet, err := wireauth.EncryptAESGCM(session.ServerToClientKey, plaintext, seq)
+plaintext, seq, err := wireauth.DecryptAESGCM(session.ClientToServerKey, packet)
 
 // Verify a session-resume proof a returning client presents, without
 // re-running the full handshake.
 ok := wireauth.VerifyResumeProof(masterKey, sessionSalt, authKeyIDBytes, serverNonce, proofB)
 ```
+
+## Migrating from v1
+
+This package now speaks protocol v2 by default (see the security note
+above) and will reject a v1 client hello unless you opt in explicitly:
+
+```go
+// Only during a migration window — remove once every client has moved
+// to v2. Logged handshakes on this server should be watched so you know
+// when it's safe to remove.
+srv := wireauth.NewServer(privateKey, wireauth.AllowLegacyV1())
+```
+
+Rollout order matters: ship client-side v2 support first (clients can
+usually try v2 and fall back to v1 based on the server's response, or you
+can stage by client version), confirm v2 traffic before removing
+`AllowLegacyV1()` from the server, then remove v1 support from clients.
+Don't flip the server to v2-only before any client can speak it — that
+just breaks every connection.
+
+The wire format itself changed (see `HANDSHAKE_SPEC.md`): v1 and v2 use
+different `cmd` values (`1`/`2` vs `101`/`102`) and different message
+sizes, so this is not a drop-in, config-only change on the client side —
+client implementations (Web, Swift, etc.) need their own update to speak
+v2, following the updated spec.
 
 ## What you get / what you're responsible for
 
@@ -145,8 +182,9 @@ ok := wireauth.VerifyResumeProof(masterKey, sessionSalt, authKeyIDBytes, serverN
 
 **Left to you:**
 - Transport itself (accepting connections, TLS termination if any, etc.)
-- Per-message sequencing (`seq` — a counter is enough; reusing a seq number
-  with the same key is a nonce-reuse risk for GCM's AAD, so don't)
+- Per-message sequencing: maintain a strictly increasing receive counter per
+  direction and reject any unexpected sequence number; this provides replay
+  protection above AES-GCM's authentication of the field.
 - Key storage/rotation for the RSA private key
 - Distributing the RSA **public** key to clients authentically (this
   package doesn't handle key pinning or distribution — that's inherently
@@ -192,9 +230,10 @@ deadline is set and you're responsible for enforcing your own timeout
 (e.g. via context cancellation upstream, or your own watchdog).
 
 **Do I need to change my client code to use this?**
-No — the wire format is unchanged from a plain reimplementation of RSA
-challenge/response + ECDH + AES-GCM described in `HANDSHAKE_SPEC.md`. Any
-client (in any language) that already speaks that protocol works as-is.
+If your client already speaks protocol v2 (see `HANDSHAKE_SPEC.md`), no.
+If it speaks the older v1 protocol, yes — v1 and v2 use different `cmd`
+values and message sizes, and v1 is no longer accepted unless the server
+opts in via `AllowLegacyV1()`. See "Migrating from v1" above.
 
 **Where's the client-side code?**
 This package is server-only. If you need a reference client implementation,
